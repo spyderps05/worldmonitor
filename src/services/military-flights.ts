@@ -126,44 +126,6 @@ function getCountryFromOperator(operator: MilitaryOperator): string {
 }
 
 /**
- * Check if a flight looks like a military aircraft
- */
-function isMilitaryFlight(state: OpenSkyStateArray): boolean {
-  const callsign = (state[1] || '').trim();
-  const icao24 = state[0];
-  const originCountry = state[2];
-
-  // Check for known military callsigns (covers all patterns from config)
-  if (callsign && identifyByCallsign(callsign)) {
-    return true;
-  }
-
-  // Check for military hex code ranges (expanded list)
-  if (isKnownMilitaryHex(icao24)) {
-    return true;
-  }
-
-  // Extended list of countries with recognizable military patterns
-  const militaryCountries = [
-    'United States', 'United Kingdom', 'France', 'Germany', 'Israel',
-    'Turkey', 'Saudi Arabia', 'United Arab Emirates', 'Qatar', 'Kuwait',
-    'Japan', 'South Korea', 'Australia', 'Canada', 'Italy', 'Spain',
-    'Netherlands', 'Poland', 'Greece', 'Norway', 'Sweden', 'India',
-    'Pakistan', 'Egypt', 'Singapore', 'Taiwan'
-  ];
-
-  if (militaryCountries.includes(originCountry)) {
-    // Check for expanded military callsign patterns
-    const militaryPattern = /^(RCH|REACH|DUKE|KING|GOLD|NAVY|ARMY|MARINE|NATO|RAF|GAF|FAF|IAF|THK|TUR|SVA|RSAF|UAF|JPN|JASDF|ROKAF|KAF|RAAF|CANFORCE|CFC|AME|PLF|HAF|EGY|PAF|FORTE|HAWK|REAPER|COBRA|RIVET|OLIVE|SNTRY|DRAGN|BONE|DEATH|DOOM|TRIDENT|ASCOT|CNV|HMX|DUSTOFF|EVAC|MOOSE|HERKY)/i.test(callsign);
-    if (callsign && militaryPattern) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-/**
  * Parse OpenSky response into MilitaryFlight objects
  */
 function parseOpenSkyResponse(data: OpenSkyResponse): MilitaryFlight[] {
@@ -173,14 +135,15 @@ function parseOpenSkyResponse(data: OpenSkyResponse): MilitaryFlight[] {
   const now = new Date();
 
   for (const state of data.states) {
-    if (!isMilitaryFlight(state)) continue;
-
     const icao24 = state[0];
     const callsign = (state[1] || '').trim();
     const lat = state[6];
     const lon = state[5];
 
     if (lat === null || lon === null) continue;
+
+    const hotspotMatch = getNearbyHotspot(lat, lon);
+    if (!hotspotMatch) continue;
 
     const info = determineAircraftInfo(callsign, icao24);
 
@@ -200,8 +163,7 @@ function parseOpenSkyResponse(data: OpenSkyResponse): MilitaryFlight[] {
     history.lastUpdate = Date.now();
 
     // Check if near interesting hotspot
-    const nearbyHotspot = getNearbyHotspot(lat, lon);
-    const isInteresting = nearbyHotspot?.priority === 'high' ||
+    const isInteresting = hotspotMatch.priority === 'high' ||
       info.type === 'bomber' ||
       info.type === 'reconnaissance' ||
       info.type === 'awacs';
@@ -230,13 +192,47 @@ function parseOpenSkyResponse(data: OpenSkyResponse): MilitaryFlight[] {
       track: history.positions.length > 1 ? [...history.positions] : undefined,
       confidence: info.confidence,
       isInteresting,
-      note: nearbyHotspot ? `Near ${nearbyHotspot.name}` : undefined,
+      note: `Near ${hotspotMatch.name}`,
     };
 
     flights.push(flight);
   }
 
   return flights;
+}
+
+function isConfirmedMilitaryFlight(flight: MilitaryFlight): boolean {
+  const callsignMatch = identifyByCallsign(flight.callsign);
+  if (callsignMatch) return true;
+
+  if (isKnownMilitaryHex(flight.hexCode)) {
+    return true;
+  }
+
+  if (flight.enriched?.confirmedMilitary) {
+    return true;
+  }
+
+  const typeCode = flight.enriched?.typeCode || flight.aircraftModel || '';
+  const normalizedType = typeCode.toUpperCase();
+  const militaryTypePattern = /^(B|C|E|F|KC|RC|RQ|MQ|P|U|VC|V|A)\d+/;
+  if (normalizedType && militaryTypePattern.test(normalizedType)) {
+    return true;
+  }
+
+  const owner = (flight.enriched?.owner || '').toLowerCase();
+  if (owner) {
+    const militaryOwnerKeywords = [
+      'air force', 'navy', 'army', 'marine', 'defense', 'defence',
+      'ministry of defence', 'ministry of defense', 'department of defense',
+      'national guard', 'coast guard', 'armed forces', 'military',
+    ];
+    if (militaryOwnerKeywords.some((keyword) => owner.includes(keyword))) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 /**
@@ -344,6 +340,7 @@ async function enrichFlightsWithWingbits(flights: MilitaryFlight[]): Promise<Mil
       manufacturer: analysis.manufacturer || undefined,
       owner: analysis.owner || undefined,
       operatorName: analysis.operator || undefined,
+      typeCode: analysis.typecode || undefined,
       builtYear: analysis.builtYear || undefined,
       confirmedMilitary: analysis.isMilitary,
       militaryBranch: analysis.militaryBranch || undefined,
@@ -474,11 +471,20 @@ export async function fetchMilitaryFlights(): Promise<{
       return { flights: flightCache.data, clusters };
     }
 
-    // Fetch from OpenSky (regional queries for efficiency)
-    let flights = await fetchFromOpenSky();
+    /**
+     * Flow:
+     * 1) Collect every flight within hotspot bounds (regional OpenSky queries).
+     * 2) Enrich candidates in batch via Wingbits (cached, configurable, single request).
+     * 3) Apply a stricter military filter using callsign/hex/type/owner signals.
+     * This keeps candidate scope bounded to hotspots while allowing enrichment to
+     * surface additional military identifiers without increasing OpenSky load.
+     */
+    const candidateFlights = await fetchFromOpenSky();
 
     // Enrich with Wingbits aircraft details (owner, operator, type)
-    flights = await enrichFlightsWithWingbits(flights);
+    const enrichedFlights = await enrichFlightsWithWingbits(candidateFlights);
+
+    const flights = enrichedFlights.filter(isConfirmedMilitaryFlight);
 
     // Update cache
     flightCache = { data: flights, timestamp: Date.now() };
